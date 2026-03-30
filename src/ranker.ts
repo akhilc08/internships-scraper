@@ -2,7 +2,19 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createObjectCsvWriter } from 'csv-writer';
 import { spawnSync } from 'child_process';
-import pdfParse from 'pdf-parse';
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const _pdfParseMod = require('pdf-parse');
+// Support both the old function-based API (mocked in tests) and the v2 class-based API.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const _pdfParseCallable: ((buf: Buffer) => Promise<{ text: string }>) | null =
+  typeof _pdfParseMod === 'function' ? _pdfParseMod
+  : typeof _pdfParseMod?.default === 'function' ? _pdfParseMod.default
+  : null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const _PDFParseClass: (new (opts: { data: Buffer }) => { getText: () => Promise<{ text: string }> }) | null =
+  _pdfParseCallable == null && typeof _pdfParseMod?.PDFParse === 'function'
+    ? _pdfParseMod.PDFParse
+    : null;
 import { JobListing } from './types';
 
 // ── CSV helpers ───────────────────────────────────────────────────────────────
@@ -57,9 +69,15 @@ export async function extractPdfText(filePath: string): Promise<string> {
     throw new Error(`Resume PDF not found: ${filePath}`);
   }
   const buffer = fs.readFileSync(filePath);
-  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-  // @ts-ignore – @types/pdf-parse describes the old function API; runtime mock uses it as a function
-  const data = await pdfParse(buffer);
+  let data: { text: string };
+  if (_pdfParseCallable) {
+    data = await _pdfParseCallable(buffer);
+  } else if (_PDFParseClass) {
+    const parser = new _PDFParseClass({ data: buffer });
+    data = await parser.getText();
+  } else {
+    throw new Error('pdf-parse: no compatible API found');
+  }
   return data.text;
 }
 
