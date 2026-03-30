@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { createObjectCsvWriter } from 'csv-writer';
 import { spawnSync } from 'child_process';
+import pdfParse from 'pdf-parse';
 import { JobListing } from './types';
 
 // ── CSV helpers ───────────────────────────────────────────────────────────────
@@ -25,7 +26,7 @@ function parseCSVLine(line: string): string[] {
   return fields;
 }
 
-function readCSV(filePath: string): JobListing[] {
+export function readCSV(filePath: string): JobListing[] {
   const content = fs.readFileSync(filePath, 'utf-8');
   const lines = content.split('\n').filter((l) => l.trim());
   if (lines.length < 2) return [];
@@ -51,33 +52,183 @@ export function findLatestCSV(dir: string): string | null {
 
 // ── extractPdfText ────────────────────────────────────────────────────────────
 
-export async function extractPdfText(_filePath: string): Promise<string> {
-  throw new Error('not implemented');
+export async function extractPdfText(filePath: string): Promise<string> {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`Resume PDF not found: ${filePath}`);
+  }
+  const buffer = fs.readFileSync(filePath);
+  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+  // @ts-ignore – @types/pdf-parse describes the old function API; runtime mock uses it as a function
+  const data = await pdfParse(buffer);
+  return data.text;
 }
 
 // ── rankBatch ─────────────────────────────────────────────────────────────────
 
-export async function rankBatch(
-  _listings: JobListing[],
-  _resumeText: string,
-): Promise<(JobListing & { score: number; reasoning: string })[]> {
-  throw new Error('not implemented');
+const RANK_PROMPT = (resumeText: string, jobs: object[]): string =>
+  `You are scoring tech internship listings against a candidate's resume to help them prioritize applications.
+
+Resume:
+${resumeText}
+
+Score each listing 1–10 based on how well it matches the candidate's skills, experience, and background.
+10 = excellent fit, 1 = poor fit. Consider: tech stack overlap, role type match, seniority fit.
+
+Return ONLY a valid JSON array, no explanation:
+[{"index": 0, "score": 8}, {"index": 1, "score": 3}, ...]
+
+Listings to score:
+${JSON.stringify(jobs, null, 2)}`;
+
+export function rankBatch(
+  batch: JobListing[],
+  offset: number,
+  resumeText: string
+): { index: number; score: number }[] {
+  const jobs = batch.map((l, i) => ({
+    index: offset + i,
+    company: l.company,
+    title: l.title,
+    description: (l.description || '').slice(0, 300),
+  }));
+
+  const result = spawnSync('claude', ['--print'], {
+    input: RANK_PROMPT(resumeText, jobs),
+    encoding: 'utf-8',
+    timeout: 180_000,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+
+  if (result.status !== 0 || !result.stdout) {
+    throw new Error(
+      `claude --print failed (exit ${result.status}): ${result.stderr?.slice(0, 500)}`
+    );
+  }
+
+  const match = result.stdout.match(/\[[\s\S]*\]/);
+  if (!match) {
+    throw new Error(`No JSON array in response:\n${result.stdout.slice(0, 500)}`);
+  }
+
+  return JSON.parse(match[0]) as { index: number; score: number }[];
 }
 
 // ── rankAll ───────────────────────────────────────────────────────────────────
 
-export async function rankAll(
-  _listings: JobListing[],
-  _resumeText: string,
-): Promise<(JobListing & { score: number; reasoning: string })[]> {
-  throw new Error('not implemented');
+export function rankAll(listings: JobListing[], resumeText: string): number[] {
+  const scores: number[] = new Array(listings.length).fill(5);
+  const BATCH_SIZE = 20;
+
+  for (let i = 0; i < listings.length; i += BATCH_SIZE) {
+    const batch = listings.slice(i, i + BATCH_SIZE);
+    console.log(`  Ranking listings ${i + 1}–${i + batch.length} via claude CLI...`);
+    try {
+      const results = rankBatch(batch, i, resumeText);
+      for (const r of results) {
+        if (r.index >= 0 && r.index < listings.length) {
+          scores[r.index] = Math.min(10, Math.max(1, r.score));
+        }
+      }
+    } catch (err) {
+      console.warn(`  Batch ${i + 1}–${i + batch.length} failed: ${(err as Error).message}`);
+      console.warn('  Falling back to score=5 for this batch...');
+    }
+  }
+
+  return scores;
 }
 
 // ── writeRankedCSV ────────────────────────────────────────────────────────────
 
+const RANKED_CSV_HEADER = [
+  { id: 'rank', title: 'Rank' },
+  { id: 'score', title: 'Score' },
+  { id: 'company', title: 'Company' },
+  { id: 'title', title: 'Title' },
+  { id: 'description', title: 'Description' },
+  { id: 'location', title: 'Location' },
+  { id: 'applicationLink', title: 'Application Link' },
+  { id: 'source', title: 'Source' },
+  { id: 'scrapedAt', title: 'Scraped At' },
+];
+
 export async function writeRankedCSV(
-  _listings: (JobListing & { score: number; reasoning: string })[],
-  _outputPath: string,
+  outputPath: string,
+  listings: JobListing[],
+  scores: number[]
 ): Promise<void> {
-  throw new Error('not implemented');
+  const paired = listings.map((l, i) => ({ listing: l, score: scores[i] }));
+  paired.sort((a, b) => b.score - a.score);
+
+  const records = paired.map((p, i) => ({
+    rank: i + 1,
+    score: p.score,
+    ...p.listing,
+  }));
+
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  const writer = createObjectCsvWriter({ path: outputPath, header: RANKED_CSV_HEADER });
+  await writer.writeRecords(records);
+  console.log(`  Wrote ${records.length} ranked listings → ${outputPath}`);
+}
+
+// ── main ─────────────────────────────────────────────────────────────────────
+
+const DATA_DIR = path.resolve(__dirname, '../data');
+const today = new Date().toISOString().slice(0, 10);
+
+async function main(): Promise<void> {
+  const resumesDir = path.resolve(__dirname, '../resumes');
+  const sweResumePath = path.join(resumesDir, 'swe.pdf');
+  const mleResumePath = path.join(resumesDir, 'mle.pdf');
+
+  const missingSwe = !fs.existsSync(sweResumePath);
+  const missingMle = !fs.existsSync(mleResumePath);
+  if (missingSwe || missingMle) {
+    const missing = [missingSwe && sweResumePath, missingMle && mleResumePath].filter(Boolean);
+    console.error(`Missing resume files:\n${(missing as string[]).join('\n')}`);
+    console.error('Place your resumes in the resumes/ directory and try again.');
+    process.exit(1);
+  }
+
+  const tracks = [
+    { label: 'SWE', dir: path.join(DATA_DIR, 'SWE'), resumePath: sweResumePath },
+    { label: 'MLE', dir: path.join(DATA_DIR, 'MLE'), resumePath: mleResumePath },
+  ];
+
+  for (const track of tracks) {
+    console.log(`\n[${track.label}] Starting ranking...`);
+
+    const csvPath = findLatestCSV(track.dir);
+    if (!csvPath) {
+      console.warn(`  No internships CSV found in ${track.dir}. Run \`npm run sort\` first.`);
+      continue;
+    }
+
+    console.log(`  Input:  ${csvPath}`);
+    console.log(`  Resume: ${track.resumePath}`);
+    console.log(`  Extracting resume text...`);
+    const resumeText = await extractPdfText(track.resumePath);
+
+    const listings = readCSV(csvPath);
+    if (listings.length === 0) {
+      console.warn(`  CSV is empty or has no data rows. Skipping.`);
+      continue;
+    }
+
+    console.log(`  Found ${listings.length} listings. Ranking...`);
+    const scores = rankAll(listings, resumeText);
+
+    const outputPath = path.join(track.dir, `ranked_${today}.csv`);
+    await writeRankedCSV(outputPath, listings, scores);
+  }
+
+  console.log('\nDone.');
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('Fatal error:', err);
+    process.exit(1);
+  });
 }

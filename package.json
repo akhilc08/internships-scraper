@@ -15,6 +15,7 @@
     "preset": "ts-jest",
     "testEnvironment": "node",
     "roots": [
+      "<rootDir>",
       "<rootDir>/tests"
     ],
     "globals": {
